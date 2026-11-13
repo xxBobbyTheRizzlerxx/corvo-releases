@@ -1,0 +1,66 @@
+# Turns a finished build into a release on this repo.
+#
+# deskbar is built in its (private) code repo. That build can't create releases here, so it
+# pushes the finished files to a temporary branch named incoming/v<version> (made from main,
+# so it includes this file), and this workflow publishes them as the release v<version> and
+# removes the branch again.
+#
+# Only the build's SSH key and the owner can push branches here, so only they can publish.
+#
+# This file is kept in the code repo under releases-repo/. Change it there and copy it over.
+
+name: Publish
+run-name: Publish ${{ github.ref_name }}
+
+on:
+  push:
+    branches: ["incoming/**"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      BRANCH: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Publish the release
+        run: |
+          set -euo pipefail
+          version=$(jq -r '.version' release.json)
+          draft=$(jq -r '.draft' release.json)
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "::error::Bad version in release.json"; exit 1; fi
+          if [ "$BRANCH" != "incoming/v$version" ]; then echo "::error::Branch $BRANCH doesn't match version $version"; exit 1; fi
+
+          tag="v$version"
+          installer="deskbar_${version}_x64-setup.exe"
+          files=(deskbar-setup.exe "$installer" "$installer.sig" latest.json)
+          for f in "${files[@]}" notes.md; do
+            if [ ! -s "$f" ]; then echo "::error::$f is missing or empty"; exit 1; fi
+          done
+          if [ "$(jq -r '.version' latest.json)" != "$version" ]; then echo "::error::latest.json is for another version"; exit 1; fi
+
+          # A published release is final (installed copies may already have it). A draft is replaced.
+          if existing=$(gh release view "$tag" --json isDraft --jq '.isDraft' 2>/dev/null); then
+            if [ "$existing" != "true" ]; then echo "::error::$tag is already published."; exit 1; fi
+            gh release delete "$tag" --yes
+          fi
+
+          options=()
+          if [ "$draft" = "true" ]; then options+=(--draft); fi
+          # The tag goes on main, not on the temporary branch, so the branch's files can be forgotten.
+          gh release create "$tag" --target main --title "deskbar $version" --notes-file notes.md "${options[@]}" "${files[@]}"
+
+      - name: Remove the temporary branch
+        if: always()
+        run: git push origin --delete "$BRANCH"
